@@ -31,24 +31,30 @@ func FormatPath(path []string) []string {
 	return ret
 }
 
-func getTableName(ctx context.Context, n ast.Node) (string, error) {
+func getTableNamePath(ctx context.Context, n ast.Node) ([]string, error) {
 	nodeMap := nodeMapFromContext(ctx)
 	found := nodeMap.FindNodeFromResolvedNode(n)
 	if len(found) == 0 {
-		return "", fmt.Errorf("failed to find path node from table node %T", n)
+		return nil, fmt.Errorf("failed to find path node from table node %T", n)
 	}
 	path, err := getPathFromNode(found[0])
 	if err != nil {
-		return "", fmt.Errorf("failed to find path: %w", err)
+		return nil, fmt.Errorf("failed to find path: %w", err)
 	}
-	return FormatName(
-		MergeNamePath(
-			namePathFromContext(ctx),
-			path,
-		),
+	return MergeNamePath(
+		namePathFromContext(ctx),
+		path,
 	), nil
 }
 
+func getTableName(ctx context.Context, n ast.Node) (string, error) {
+	namePath, err := getTableNamePath(ctx, n)
+	if err != nil {
+		return "", err
+	}
+
+	return FormatName(namePath), nil
+}
 func getFuncName(ctx context.Context, n ast.Node) (string, error) {
 	nodeMap := nodeMapFromContext(ctx)
 	found := nodeMap.FindNodeFromResolvedNode(n)
@@ -585,18 +591,57 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
-	tableName, err := getTableName(ctx, n.node)
+	tableNamePath, err := getTableNamePath(ctx, n.node)
 	if err != nil {
 		return "", err
 	}
+
+	wildcardMatchTables := []struct {
+		name   string
+		suffix string
+	}{}
+
+	wildcardTableMap := wildcardTableMapFromContext(ctx)
+	matches, isWildcardTable := wildcardTableMap[strings.Join(tableNamePath, ".")]
+	if isWildcardTable {
+		for _, match := range matches {
+			wildcardMatchTables = append(wildcardMatchTables, struct {
+				name   string
+				suffix string
+			}{
+				name:   strings.Join(strings.Split(match.Table.Name(), "."), "_"),
+				suffix: match.Suffix,
+			})
+		}
+	}
+
 	var columns []string
+	tableSuffixColumnName := ""
 	for _, col := range n.node.ColumnList() {
+		if col.Name() == "_TABLE_SUFFIX" {
+			tableSuffixColumnName = fmt.Sprintf("%s#%d", col.Name(), col.ColumnID())
+			continue
+		}
 		columns = append(
 			columns,
 			fmt.Sprintf("`%s` AS `%s`", col.Name(), uniqueColumnName(ctx, col)),
 		)
 	}
-	return fmt.Sprintf("(SELECT %s FROM `%s`)", strings.Join(columns, ","), tableName), nil
+
+	if !isWildcardTable {
+		return fmt.Sprintf("(SELECT %s FROM `%s`)", strings.Join(columns, ","), FormatName(tableNamePath)), nil
+	}
+
+	selectSQLs := []string{}
+	for _, table := range wildcardMatchTables {
+		tableSuffixValue, err := LiteralFromValue(StringValue(table.suffix))
+		if err != nil {
+			return "", err
+		}
+		sql := fmt.Sprintf("SELECT %s, %s AS `%s` FROM `%s`", strings.Join(columns, ","), tableSuffixValue, tableSuffixColumnName, table.name)
+		selectSQLs = append(selectSQLs, sql)
+	}
+	return fmt.Sprintf("(%s)", strings.Join(selectSQLs, " UNION ALL ")), nil
 }
 
 func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {

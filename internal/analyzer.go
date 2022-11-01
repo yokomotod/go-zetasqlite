@@ -185,11 +185,12 @@ func (a *Analyzer) AnalyzeIterator(ctx context.Context, conn *Conn, query string
 		funcMap[spec.FuncName()] = spec
 	}
 	return &AnalyzerOutputIterator{
-		query:    query,
-		args:     args,
-		stmts:    resultStmts,
-		analyzer: a,
-		funcMap:  funcMap,
+		query:            query,
+		args:             args,
+		stmts:            resultStmts,
+		analyzer:         a,
+		funcMap:          funcMap,
+		wildcardTableMap: map[string][]WildcardMatchTable{},
 	}, nil
 }
 
@@ -199,15 +200,128 @@ type Statement struct {
 }
 
 type AnalyzerOutputIterator struct {
-	query    string
-	args     []driver.NamedValue
-	analyzer *Analyzer
-	stmts    []*Statement
-	stmtIdx  int
-	funcMap  map[string]*FunctionSpec
-	out      *zetasql.AnalyzerOutput
-	isEnd    bool
-	err      error
+	query            string
+	args             []driver.NamedValue
+	analyzer         *Analyzer
+	stmts            []*Statement
+	stmtIdx          int
+	funcMap          map[string]*FunctionSpec
+	wildcardTableMap map[string][]WildcardMatchTable
+	out              *zetasql.AnalyzerOutput
+	isEnd            bool
+	err              error
+}
+
+func findWildcardTables(node parsed_ast.Node) ([]string, error) {
+	var names []string
+
+	if node.Kind() == parsed_ast.Identifier &&
+		node.Parent().Kind() == parsed_ast.PathExpression &&
+		node.Parent().Parent().Kind() == parsed_ast.TablePathExpression &&
+		(node.Parent().Parent().Parent().Kind() == parsed_ast.FromClause || node.Parent().Parent().Parent().Kind() == parsed_ast.Join) {
+		name, err := getPathFromNode(node)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, name := range name {
+			if strings.HasSuffix(name, "*") {
+				names = append(names, name)
+			}
+		}
+	}
+
+	for i := 0; i < node.NumChildren(); i++ {
+		child := node.Child(i)
+		if child == nil {
+			// it is do possible to got nil, ex: SELECT STRING(JSON '"purple"') AS color
+			continue
+		}
+		n, err := findWildcardTables(child)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, n...)
+	}
+
+	return names, nil
+}
+
+type WildcardMatchTable struct {
+	Table  types.Table
+	Suffix string
+}
+
+func findMatchTables(wildcardTable string, tables []types.Table) []WildcardMatchTable {
+	var matches []WildcardMatchTable
+
+	prefix := strings.TrimSuffix(wildcardTable, "*")
+	for _, table := range tables {
+		tableName := table.Name()
+		if strings.HasPrefix(tableName, prefix) {
+			suffix := strings.TrimPrefix(tableName, prefix)
+			matches = append(matches, WildcardMatchTable{
+				Table:  table,
+				Suffix: suffix,
+			})
+		}
+	}
+
+	return matches
+}
+
+func getWildcardTableMap(stmt parsed_ast.StatementNode, catalog *types.SimpleCatalog) ([]*TableSpec, map[string][]WildcardMatchTable, error) {
+	wildcardSpecs := []*TableSpec{}
+	wildcardTableMap := map[string][]WildcardMatchTable{}
+
+	wildcardTables, err := findWildcardTables(stmt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("findWildcardTables: %w", err)
+	}
+
+	tables, err := catalog.Tables()
+	if err != nil {
+		return nil, nil, fmt.Errorf("getCatalog: %w", err)
+	}
+
+	for _, wildcardTable := range wildcardTables {
+		matches := findMatchTables(wildcardTable, tables)
+		if len(matches) == 0 {
+			return nil, nil, fmt.Errorf("%s does not match any table", wildcardTable)
+		}
+
+		numColumns := matches[0].Table.NumColumns()
+		columns := make([]*ColumnSpec, numColumns, numColumns+1)
+		for i := 0; i < numColumns; i++ {
+			col := matches[0].Table.Column(i)
+			typ := col.Type()
+			columns[i] = &ColumnSpec{
+				Name: col.Name(),
+				Type: &Type{
+					Name:        typ.TypeName(types.ProductInternal),
+					Kind:        int(typ.Kind()),
+					ElementType: &Type{},
+					FieldTypes:  []*NameWithType{},
+				},
+			}
+		}
+		columns = append(columns, &ColumnSpec{
+			Name: "_TABLE_SUFFIX",
+			Type: &Type{
+				Name: "STRING",
+				Kind: types.STRING,
+			},
+			IsNotNull: true,
+		})
+		wildcardTableSpec := &TableSpec{
+			NamePath: []string{wildcardTable},
+			Columns:  columns,
+		}
+		wildcardSpecs = append(wildcardSpecs, wildcardTableSpec)
+		wildcardTableMap[wildcardTable] = append(wildcardTableMap[wildcardTable], matches...)
+	}
+
+	return wildcardSpecs, wildcardTableMap, nil
 }
 
 func (it *AnalyzerOutputIterator) Next() bool {
@@ -216,6 +330,17 @@ func (it *AnalyzerOutputIterator) Next() bool {
 	}
 	stmt := it.stmts[it.stmtIdx]
 	it.analyzer.opt.SetParameterMode(stmt.mode)
+
+	wildcardSpecs, wildcardTableMap, err := getWildcardTableMap(stmt.stmt, it.analyzer.catalog.getCatalog(it.analyzer.namePath))
+	if err != nil {
+		it.err = err
+		return false
+	}
+	for _, wildcardSpec := range wildcardSpecs {
+		it.analyzer.catalog.addTableSpec(wildcardSpec)
+	}
+	it.wildcardTableMap = wildcardTableMap
+
 	out, err := zetasql.AnalyzeStatementFromParserAST(
 		it.query,
 		stmt.stmt,
@@ -240,6 +365,7 @@ func (it *AnalyzerOutputIterator) Analyze(ctx context.Context) (*AnalyzerOutput,
 	ctx = withColumnRefMap(ctx, map[string]string{})
 	ctx = withTableNameToColumnListMap(ctx, map[string][]*ast.Column{})
 	ctx = withFuncMap(ctx, it.funcMap)
+	ctx = withWildcardTableMap(ctx, it.wildcardTableMap)
 	ctx = withAnalyticOrderColumnNames(ctx, &analyticOrderColumnNames{})
 	stmtNode := it.out.Statement()
 	ctx = withNodeMap(ctx, zetasql.NewNodeMap(stmtNode, it.stmts[it.stmtIdx-1].stmt))

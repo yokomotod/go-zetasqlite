@@ -31,6 +31,7 @@ func TestQuery(t *testing.T) {
 		name         string
 		query        string
 		args         []interface{}
+		setup        func(ctx context.Context, db *sql.DB) error
 		expectedRows [][]interface{}
 		expectedErr  bool
 	}{
@@ -3220,9 +3221,37 @@ FROM
 				{"false", "boolean"},
 			},
 		},
+
+		// wildcard tables
+		{
+			name: "wildcard tables join _TABLE_SUFFIX",
+			setup: func(ctx context.Context, db *sql.DB) error {
+				queries := []string{
+					"CREATE TABLE `dataset_x.table_a` AS SELECT 1 AS val",
+					"CREATE TABLE `dataset_x.table_b` AS SELECT 2 AS val",
+					"CREATE TABLE `dataset_x.foo_bar` AS SELECT 1 AS val",
+					"CREATE TABLE `dataset_x.foo_buz` AS SELECT 2 AS val",
+				}
+				for _, query := range queries {
+					if _, err := db.ExecContext(ctx, query); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			query:        "SELECT * FROM (SELECT * FROM `dataset_x.table_*` WHERE _TABLE_SUFFIX = 'a') AS s JOIN (SELECT * FROM `dataset_x.foo_*` WHERE _TABLE_SUFFIX = 'bar') AS f ON f.val = s.val ORDER BY s.val",
+			expectedRows: [][]interface{}{{int64(1), "a", int64(1), "bar"}},
+		},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
+			if test.setup != nil {
+				err := test.setup(ctx, db)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
 			rows, err := db.QueryContext(ctx, test.query, test.args...)
 			if err != nil {
 				if !test.expectedErr {

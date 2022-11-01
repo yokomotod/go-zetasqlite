@@ -13,6 +13,7 @@ type (
 	nodeMapKey                      struct{}
 	columnRefMapKey                 struct{}
 	funcMapKey                      struct{}
+	wildcardTableMapKey             struct{}
 	analyticOrderColumnNamesKey     struct{}
 	analyticPartitionColumnNamesKey struct{}
 	analyticTableNameKey            struct{}
@@ -72,6 +73,18 @@ func funcMapFromContext(ctx context.Context) map[string]*FunctionSpec {
 		return nil
 	}
 	return value.(map[string]*FunctionSpec)
+}
+
+func withWildcardTableMap(ctx context.Context, m map[string][]WildcardMatchTable) context.Context {
+	return context.WithValue(ctx, wildcardTableMapKey{}, m)
+}
+
+func wildcardTableMapFromContext(ctx context.Context) map[string][]WildcardMatchTable {
+	value := ctx.Value(wildcardTableMapKey{})
+	if value == nil {
+		return nil
+	}
+	return value.(map[string][]WildcardMatchTable)
 }
 
 type analyticOrderBy struct {
