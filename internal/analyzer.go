@@ -331,7 +331,7 @@ func (it *AnalyzerOutputIterator) Next() bool {
 	stmt := it.stmts[it.stmtIdx]
 	it.analyzer.opt.SetParameterMode(stmt.mode)
 
-	wildcardSpecs, wildcardTableMap, err := getWildcardTableMap(stmt.stmt, it.analyzer.catalog.getCatalog(it.analyzer.namePath))
+	wildcardSpecs, wildcardTableMap, err := getWildcardTableMap(stmt.stmt, it.analyzer.catalog.catalog)
 	if err != nil {
 		it.err = err
 		return false
@@ -344,7 +344,7 @@ func (it *AnalyzerOutputIterator) Next() bool {
 	out, err := zetasql.AnalyzeStatementFromParserAST(
 		it.query,
 		stmt.stmt,
-		it.analyzer.catalog.getCatalog(it.analyzer.namePath),
+		it.analyzer.catalog.catalog,
 		it.analyzer.opt,
 	)
 	it.err = err
@@ -373,6 +373,7 @@ func (it *AnalyzerOutputIterator) Analyze(ctx context.Context) (*AnalyzerOutput,
 	case ast.CreateTableStmt:
 		return it.analyzeCreateTableStmt(ctx, stmtNode.(*ast.CreateTableStmtNode))
 	case ast.CreateTableAsSelectStmt:
+		ctx = withUseColumnID(ctx)
 		return it.analyzeCreateTableAsSelectStmt(ctx, stmtNode.(*ast.CreateTableAsSelectStmtNode))
 	case ast.CreateFunctionStmt:
 		return it.analyzeCreateFunctionStmt(ctx, stmtNode.(*ast.CreateFunctionStmtNode))
